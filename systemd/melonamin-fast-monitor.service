@@ -1,0 +1,13 @@
+[Unit]
+Description=Record a passive Fast.com network speed test
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+Environment=MELONAMIN_FAST_DURATION=3
+ExecStart=%h/.config/omarchy/plugins/melonamin.fast/run-scheduled-test
+Nice=10
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=1min

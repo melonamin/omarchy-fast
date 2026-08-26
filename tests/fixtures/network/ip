@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${1:-} == route && ${2:-} == get ]]; then
+  printf '1.1.1.1 dev lo src 127.0.0.1\n'
+else
+  exec /usr/bin/ip "$@"
+fi

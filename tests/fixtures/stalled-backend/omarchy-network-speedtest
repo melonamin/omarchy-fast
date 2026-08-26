@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$$" >"${MELONAMIN_FAST_TEST_PID_FILE:?pid file required}"
+while true; do
+  printf '0.0\n'
+  sleep 0.1
+done

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -uo pipefail
+export LC_ALL=C
+
+direction="${1:-}"
+duration="${2:-5}"
+ready_timeout="${MELONAMIN_FAST_READY_TIMEOUT:-10}"
+
+case "$direction" in
+  down | up) ;;
+  *)
+    echo "Usage: run-speedtest [down|up] [seconds]" >&2
+    exit 2
+    ;;
+esac
+
+[[ $duration =~ ^[0-9]+$ ]] && (( duration > 0 )) || {
+  echo "Duration must be a positive integer" >&2
+  exit 2
+}
+
+[[ $ready_timeout =~ ^[0-9]+$ ]] && (( ready_timeout > 0 )) || {
+  echo "MELONAMIN_FAST_READY_TIMEOUT must be a positive integer" >&2
+  exit 2
+}
+
+group_pid=""
+backend_output=""
+state_dir="${MELONAMIN_FAST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugins/melonamin.fast}"
+
+mkdir -p "$state_dir"
+
+# Scheduled and interactive runs share one traffic lock. A scheduled runner
+# holds descriptor 9 for its complete down/up cycle and tells its child phases
+# to reuse that inherited lock.
+if [[ ${MELONAMIN_FAST_LOCK_HELD:-0} != 1 ]]; then
+  exec 9>"$state_dir/speedtest.lock"
+  if ! flock -n 9; then
+    echo "Another Fast speed test is already running" >&2
+    exit 75
+  fi
+fi
+
+stop_group() {
+  [[ -n $group_pid ]] || return 0
+  kill -TERM -- "-$group_pid" 2>/dev/null || true
+
+  # The stock uploader may be blocked inside curl. Give its EXIT trap a brief
+  # chance, then guarantee the whole private process group is gone.
+  for _ in 1 2 3 4 5; do
+    kill -0 -- "-$group_pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL -- "-$group_pid" 2>/dev/null || true
+}
+
+cleanup() {
+  stop_group
+  group_pid=""
+  [[ -z $backend_output ]] || rm -f "$backend_output"
+}
+
+ensure_backend_running() {
+  kill -0 "$group_pid" 2>/dev/null && return 0
+
+  local backend_status
+  if wait "$group_pid"; then
+    backend_status=0
+  else
+    backend_status=$?
+  fi
+  # The parent normally cleans up its workers, but retaining the process-group
+  # id here also covers a backend killed before its EXIT trap can run.
+  stop_group
+  group_pid=""
+
+  echo "Fast.com traffic generator stopped before the measurement completed" >&2
+  (( backend_status != 0 )) && exit "$backend_status"
+  exit 1
+}
+
+trap 'cleanup; exit 143' TERM INT HUP
+trap cleanup EXIT
+
+# Resolve the same active interface as Omarchy's traffic generator, then watch
+# its byte counter ourselves. The stock command emits once a second; sampling
+# /sys at 10 Hz gives the UI enough real data to animate fluidly without adding
+# any extra network traffic.
+iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+if [[ -z $iface ]]; then
+  echo "No active network interface" >&2
+  exit 1
+fi
+
+if [[ $direction == down ]]; then
+  counter_path="/sys/class/net/$iface/statistics/rx_bytes"
+else
+  counter_path="/sys/class/net/$iface/statistics/tx_bytes"
+fi
+counter_path="${MELONAMIN_FAST_COUNTER_PATH:-$counter_path}"
+
+[[ -r $counter_path ]] || {
+  echo "Network byte counter is unavailable" >&2
+  exit 1
+}
+
+# A fresh session gives every transfer worker one process-group boundary. The
+# wrapper owns the clock and the sample stream; the child command only creates
+# traffic, with its coarse one-second readings discarded.
+backend_output=$(mktemp "$state_dir/.backend-output.XXXXXX")
+ready_before_bytes=$(<"$counter_path")
+setsid omarchy-network-speedtest "$direction" >"$backend_output" &
+group_pid=$!
+
+# The stock backend performs endpoint discovery before starting traffic and
+# emits its first reading only after workers have transferred for one interval.
+# Do not mistake a live-but-still-discovering process for a ready speed test.
+backend_ready=false
+for (( attempt = 0; attempt < ready_timeout * 10; attempt++ )); do
+  sleep 0.1
+  ensure_backend_running
+  ready_after_bytes=$(<"$counter_path")
+  if [[ -s $backend_output && $ready_after_bytes =~ ^[0-9]+$ ]] \
+      && (( ready_after_bytes > ready_before_bytes )); then
+    backend_ready=true
+    break
+  fi
+done
+
+if [[ $backend_ready != true ]]; then
+  echo "Fast.com traffic generator did not begin transferring within ${ready_timeout}s" >&2
+  exit 1
+fi
+
+ensure_backend_running
+
+before_bytes=$(<"$counter_path")
+before_time=$EPOCHREALTIME
+sample_count=$((duration * 10))
+
+for (( sample = 0; sample < sample_count; sample++ )); do
+  sleep 0.1
+  ensure_backend_running
+  after_time=$EPOCHREALTIME
+  after_bytes=$(<"$counter_path")
+
+  awk -v before="$before_bytes" -v after="$after_bytes" \
+      -v started="$before_time" -v ended="$after_time" 'BEGIN {
+    elapsed = ended - started
+    if (elapsed <= 0 || after < before) print "0.0"
+    else printf "%.1f\n", (after - before) * 8 / elapsed / 1000000
+  }'
+
+  before_bytes=$after_bytes
+  before_time=$after_time
+done
+
+ensure_backend_running
+stop_group
+wait "$group_pid" 2>/dev/null || true
+group_pid=""
+trap - TERM INT HUP
+exit 0

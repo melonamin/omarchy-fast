@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${1:-} == --verbose ]]; then
+  printf 'iface\teth0\ntype\tethernet\ninternet_ping_ms\t12.3\n'
+else
+  printf 'ethernet\teth0\t\t\n'
+fi

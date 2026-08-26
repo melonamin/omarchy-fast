@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+direction=${1:?direction required}
+
+if [[ $direction == down ]]; then
+  printf '101.0\n'
+  exit 0
+fi
+
+: >"${MELONAMIN_FAST_UP_STARTED:?up marker required}"
+while [[ ! -e ${MELONAMIN_FAST_RELEASE:?release marker required} ]]; do
+  sleep 0.02
+done
+printf '201.0\n'

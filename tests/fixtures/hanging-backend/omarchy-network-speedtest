@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -z ${MELONAMIN_FAST_TEST_PID_FILE:-} ]] || printf '%s\n' "$$" >"$MELONAMIN_FAST_TEST_PID_FILE"
+exec sleep 30

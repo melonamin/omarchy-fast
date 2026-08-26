@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+direction=${1:?direction required}
+duration=${2:?duration required}
+base=100
+[[ $direction == up ]] && base=200
+
+for (( sample = 1; sample <= duration * 10; sample++ )); do
+  printf '%s.0\n' "$((base + sample))"
+done

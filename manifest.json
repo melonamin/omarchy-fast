@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "melonamin.fast",
+  "name": "Fast: Network Speed Test",
+  "version": "1.0.0",
+  "author": "melonamin",
+  "license": "MIT",
+  "description": "A terminal-inspired Fast.com speed test for the Omarchy bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Fast: Network Speed Test",
+    "description": "Live download and upload sparklines in a compact terminal-style panel",
+    "category": "Network",
+    "aliases": ["fast", "speed-test", "network-speed"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

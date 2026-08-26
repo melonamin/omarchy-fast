@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+plugin_dir=$(cd "$(dirname "$0")" && pwd)
+helper="${MELONAMIN_FAST_HELPER:-$plugin_dir/run-speedtest}"
+status_command="${MELONAMIN_FAST_STATUS_COMMAND:-omarchy-network-status}"
+state_dir="${MELONAMIN_FAST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugins/melonamin.fast}"
+history_path="$state_dir/history.json"
+duration="${MELONAMIN_FAST_DURATION:-3}"
+history_limit=8
+
+[[ $duration =~ ^[0-9]+$ ]] && (( duration > 0 )) || {
+  echo "MELONAMIN_FAST_DURATION must be a positive integer" >&2
+  exit 2
+}
+
+mkdir -p "$state_dir"
+exec 9>"$state_dir/speedtest.lock"
+
+# A passive run should never interrupt a test the user started themselves.
+if ! flock -n 9; then
+  echo "Fast monitor skipped: another speed test is already running"
+  exit 0
+fi
+
+export MELONAMIN_FAST_LOCK_HELD=1
+download_file=$(mktemp "$state_dir/.scheduled-down.XXXXXX")
+upload_file=$(mktemp "$state_dir/.scheduled-up.XXXXXX")
+history_tmp=$(mktemp "$state_dir/.history.XXXXXX")
+
+cleanup() {
+  rm -f "$download_file" "$upload_file" "$history_tmp"
+}
+trap cleanup EXIT
+
+"$helper" down "$duration" >"$download_file"
+"$helper" up "$duration" >"$upload_file"
+
+settled_average() {
+  local input=$1
+  local sample_total skip
+  sample_total=$(wc -l <"$input")
+  skip=0
+  if (( sample_total >= 20 )); then
+    skip=$((sample_total / 5))
+    (( skip > 10 )) && skip=10
+  elif (( sample_total >= 3 )); then
+    skip=1
+  fi
+
+  awk -v skip="$skip" 'NR > skip { total += $1; count++ }
+    END { if (count > 0) printf "%.6f", total / count; else print "0" }' "$input"
+}
+
+download=$(settled_average "$download_file")
+upload=$(settled_average "$upload_file")
+details=$("$status_command" --verbose 2>/dev/null || true)
+ping=$(awk -F '\t' '$1 == "internet_ping_ms" { print $2; exit }' <<<"$details")
+timestamp=$(date +%s%3N)
+
+if [[ $ping =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  ping_json=$ping
+else
+  ping_json=null
+fi
+
+entry=$(jq -cn \
+  --argjson timestamp "$timestamp" \
+  --argjson down "$download" \
+  --argjson up "$upload" \
+  --argjson ping "$ping_json" \
+  '{timestamp: $timestamp, down: $down, up: $up, ping: $ping, automatic: true}')
+
+if [[ -s $history_path ]]; then
+  existing=$(jq -c 'if type == "array" then . else [] end' "$history_path" 2>/dev/null || printf '[]')
+else
+  existing='[]'
+fi
+
+jq -n --argjson entry "$entry" --argjson existing "$existing" \
+  --argjson limit "$history_limit" '([$entry] + $existing)[:$limit]' >"$history_tmp"
+mv "$history_tmp" "$history_path"
+
+printf 'Fast monitor complete: down %.1f Mbps, up %.1f Mbps' "$download" "$upload"
+if [[ $ping_json != null ]]; then printf ', ping %.1f ms' "$ping"; fi
+printf '\n'
