@@ -4,6 +4,8 @@ A terminal-inspired Fast.com speed test for the Omarchy bar. It uses
 Omarchy's own `omarchy-network-speedtest` backend for both on-demand and
 passive scheduled tests.
 
+![Fast showing a completed network speed test and recent history](preview.png)
+
 ## Install
 
 ```sh
