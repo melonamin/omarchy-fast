@@ -397,6 +397,7 @@ Panel {
 
             Text {
               text: root.connectionName === "" ? "" : "— " + root.connectionName
+              textFormat: Text.PlainText
               color: root.mutedText
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall

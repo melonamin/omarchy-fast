@@ -77,3 +77,11 @@ test("panel keeps download and upload in one interactive process", () => {
   assert.match(qml, /__MELONAMIN_FAST_PHASE__:up/)
   assert.match(qml, /speedProc\.command = \[interactiveHelperPath, "5"\]/)
 })
+
+test("panel renders the external connection label as plain text", () => {
+  const qml = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  assert.match(
+    qml,
+    /text:\s*root\.connectionName[^\n]*\n\s*textFormat:\s*Text\.PlainText/
+  )
+})
