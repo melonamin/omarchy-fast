@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "melonamin.fast",
   "name": "Fast: Network Speed Test",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "melonamin",
   "license": "MIT",
   "description": "A terminal-inspired Fast.com speed test for the Omarchy bar",

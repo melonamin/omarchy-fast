@@ -24,22 +24,17 @@ esac
   exit 2
 }
 
-group_pid=""
-backend_output=""
-state_dir="${MELONAMIN_FAST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugins/melonamin.fast}"
+plugin_dir=$(cd "$(dirname "$0")" && pwd)
+state_helper="$plugin_dir/safe-state"
 
-mkdir -p "$state_dir"
-
-# Scheduled and interactive runs share one traffic lock. A scheduled runner
-# holds descriptor 9 for its complete down/up cycle and tells its child phases
-# to reuse that inherited lock.
+# Acquire the shared lock through a no-follow descriptor. The helper keeps the
+# descriptor open across exec, and phase children inherit it for the full run.
 if [[ ${MELONAMIN_FAST_LOCK_HELD:-0} != 1 ]]; then
-  exec 9>"$state_dir/speedtest.lock"
-  if ! flock -n 9; then
-    echo "Another Fast speed test is already running" >&2
-    exit 75
-  fi
+  exec "$state_helper" lock -- "$0" "$direction" "$duration"
 fi
+
+group_pid=""
+backend_fd=""
 
 stop_group() {
   [[ -n $group_pid ]] || return 0
@@ -57,7 +52,10 @@ stop_group() {
 cleanup() {
   stop_group
   group_pid=""
-  [[ -z $backend_output ]] || rm -f "$backend_output"
+  if [[ -n $backend_fd ]]; then
+    exec {backend_fd}<&- 2>/dev/null || true
+    backend_fd=""
+  fi
 }
 
 ensure_backend_running() {
@@ -104,23 +102,28 @@ counter_path="${MELONAMIN_FAST_COUNTER_PATH:-$counter_path}"
   exit 1
 }
 
-# A fresh session gives every transfer worker one process-group boundary. The
-# wrapper owns the clock and the sample stream; the child command only creates
-# traffic, with its coarse one-second readings discarded.
-backend_output=$(mktemp "$state_dir/.backend-output.XXXXXX")
+# A fresh session gives every transfer worker one process-group boundary. A
+# coprocess pipe proves that the backend emitted a reading without creating a
+# pathname that can be replaced between creation and redirection.
 ready_before_bytes=$(<"$counter_path")
-setsid omarchy-network-speedtest "$direction" >"$backend_output" &
-group_pid=$!
+coproc FAST_BACKEND { exec setsid omarchy-network-speedtest "$direction"; }
+group_pid=$FAST_BACKEND_PID
+backend_fd=${FAST_BACKEND[0]}
 
 # The stock backend performs endpoint discovery before starting traffic and
 # emits its first reading only after workers have transferred for one interval.
 # Do not mistake a live-but-still-discovering process for a ready speed test.
 backend_ready=false
+backend_emitted=false
 for (( attempt = 0; attempt < ready_timeout * 10; attempt++ )); do
-  sleep 0.1
+  if [[ $backend_emitted != true ]] \
+      && IFS= read -r -t 0.01 _backend_line <&"$backend_fd"; then
+    backend_emitted=true
+  fi
+  sleep 0.09
   ensure_backend_running
   ready_after_bytes=$(<"$counter_path")
-  if [[ -s $backend_output && $ready_after_bytes =~ ^[0-9]+$ ]] \
+  if [[ $backend_emitted == true && $ready_after_bytes =~ ^[0-9]+$ ]] \
       && (( ready_after_bytes > ready_before_bytes )); then
     backend_ready=true
     break

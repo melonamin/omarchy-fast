@@ -22,12 +22,10 @@ Panel {
   readonly property color downloadColor: darkSurface ? "#2EF8BB" : "#087F5B"
   readonly property color uploadColor: darkSurface ? "#BD52FF" : "#7B2CBF"
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property string interactiveHelperPath: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/melonamin.fast/run-interactive-test"
-  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME")
-    || Quickshell.env("HOME") + "/.local/state"
-  readonly property string stateDir: stateHome + "/omarchy/plugins/melonamin.fast"
-  readonly property string historyPath: stateDir + "/history.json"
+  readonly property string pluginPath: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/melonamin.fast"
+  readonly property string interactiveHelperPath: pluginPath + "/run-interactive-test"
+  readonly property string stateHelperPath: pluginPath + "/safe-state"
   readonly property int historyLimit: 8
 
   property bool running: false
@@ -93,6 +91,7 @@ Panel {
     setCenterHoverRevealSuppressed(false)
     controller.show()
     refreshConnection()
+    refreshHistory()
     if (!hasResult && !running) runTest()
   }
 
@@ -100,6 +99,7 @@ Panel {
     openedFromHotkey = true
     controller.show()
     refreshConnection()
+    refreshHistory()
     if (!hasResult && !running) runTest()
     Qt.callLater(function() {
       if (root.opened) root.setCenterHoverRevealSuppressed(true)
@@ -219,7 +219,7 @@ Panel {
       up: uploadResult,
       ping: pingMs >= 0 ? pingMs : null
     }, historyLimit)
-    historyFile.setText(JSON.stringify(history, null, 2) + "\n")
+    persistHistoryEntry()
     completionBurst.burst()
   }
 
@@ -244,23 +244,41 @@ Panel {
     history = Model.parseHistory(raw, historyLimit)
   }
 
-  Component.onCompleted: stateDirProc.running = true
+  function refreshHistory() {
+    if (historyReadProc.running || historyWriteProc.running) return
+    historyReadProc.command = [stateHelperPath, "history-read"]
+    historyReadProc.running = true
+  }
 
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadHistory(text())
-    onLoadFailed: root.loadHistory("[]")
-    onFileChanged: reload()
+  function persistHistoryEntry() {
+    var command = [
+      stateHelperPath,
+      "history-add",
+      "--timestamp", String(finishedAt),
+      "--down", String(downloadResult),
+      "--up", String(uploadResult)
+    ]
+    if (pingMs >= 0) command.push("--ping", String(pingMs))
+    historyWriteProc.command = command
+    historyWriteProc.running = true
+  }
+
+  Component.onCompleted: refreshHistory()
+
+  Process {
+    id: historyReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadHistory(text)
+    }
   }
 
   Process {
-    id: stateDirProc
-    command: ["mkdir", "-p", root.stateDir]
-    onExited: historyFile.reload()
+    id: historyWriteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadHistory(text)
+    }
   }
 
   Process {

@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Descriptor-safe state and locking operations for melonamin.fast."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import math
+import os
+import secrets
+import stat
+import sys
+from typing import Any
+
+
+HISTORY_LIMIT = 8
+MAX_HISTORY_BYTES = 64 * 1024
+STATE_SUFFIX = ("omarchy", "plugins", "melonamin.fast")
+
+
+class StateError(RuntimeError):
+    pass
+
+
+def state_path() -> str:
+    override = os.environ.get("MELONAMIN_FAST_STATE_DIR")
+    if override:
+        path = override
+    else:
+        state_home = os.environ.get("XDG_STATE_HOME")
+        if not state_home:
+            home = os.environ.get("HOME")
+            if not home:
+                raise StateError("HOME is unavailable")
+            state_home = os.path.join(home, ".local", "state")
+        path = os.path.join(state_home, *STATE_SUFFIX)
+
+    if not os.path.isabs(path):
+        raise StateError("state directory must be absolute")
+    raw_parts = path.split(os.sep)
+    if any(part in (".", "..") for part in raw_parts):
+        raise StateError("state directory cannot contain '.' or '..'")
+    normalized = os.path.normpath(path)
+    if normalized == os.sep:
+        raise StateError("state directory cannot be the filesystem root")
+    return normalized
+
+
+def directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def verify_directory(fd: int, path: str, *, final: bool) -> None:
+    info = os.fstat(fd)
+    uid = os.getuid()
+    if not stat.S_ISDIR(info.st_mode):
+        raise StateError(f"state path component is not a directory: {path}")
+    if info.st_uid not in (0, uid):
+        raise StateError(f"state path component has an unexpected owner: {path}")
+
+    writable_by_others = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if info.st_uid == uid and writable_by_others:
+        raise StateError(f"state path component is writable by another user: {path}")
+    if info.st_uid == 0 and writable_by_others and not (info.st_mode & stat.S_ISVTX):
+        raise StateError(f"system state path component is insecure: {path}")
+    if final:
+        if info.st_uid != uid:
+            raise StateError("state directory must be owned by the current user")
+        os.fchmod(fd, 0o700)
+
+
+def open_state_directory() -> tuple[int, str]:
+    path = state_path()
+    parts = [part for part in path.split(os.sep) if part]
+    current_fd = os.open(os.sep, directory_flags())
+    current_path = os.sep
+    try:
+        for index, part in enumerate(parts):
+            next_path = os.path.join(current_path, part)
+            while True:
+                try:
+                    next_fd = os.open(part, directory_flags(), dir_fd=current_fd)
+                    break
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        continue
+                except OSError as error:
+                    if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise StateError(f"state path cannot contain symlinks: {next_path}") from error
+                    raise
+
+            verify_directory(next_fd, next_path, final=index == len(parts) - 1)
+            os.close(current_fd)
+            current_fd = next_fd
+            current_path = next_path
+        return current_fd, path
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def checked_regular_file(fd: int, name: str, *, max_bytes: int | None = None) -> os.stat_result:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise StateError(f"state file is not regular: {name}")
+    if info.st_uid != os.getuid():
+        raise StateError(f"state file has an unexpected owner: {name}")
+    if info.st_nlink != 1:
+        raise StateError(f"state file has multiple links: {name}")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise StateError(f"state file is writable by another user: {name}")
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise StateError(f"state file exceeds {max_bytes} bytes: {name}")
+    return info
+
+
+def open_lock(directory_fd: int, name: str) -> int:
+    common = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, common | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)
+    except FileExistsError:
+        try:
+            fd = os.open(name, common, dir_fd=directory_fd)
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENXIO):
+                raise StateError(f"unsafe state lock: {name}") from error
+            raise
+
+    try:
+        checked_regular_file(fd, name)
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def acquire_lock(fd: int, *, nonblocking: bool) -> bool:
+    operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(fd, operation)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def numeric(value: Any, *, nullable: bool = False) -> float | int | None:
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError
+    return value
+
+
+def normalize_history_entry(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        timestamp = numeric(value.get("timestamp"))
+        down = numeric(value.get("down"))
+        up = numeric(value.get("up"))
+        ping = numeric(value.get("ping"), nullable=True)
+    except ValueError:
+        return None
+    if timestamp is None or float(timestamp) <= 0 or down is None or up is None:
+        return None
+    entry = {"timestamp": timestamp, "down": down, "up": up, "ping": ping}
+    if value.get("automatic") is True:
+        entry["automatic"] = True
+    return entry
+
+
+def read_history(directory_fd: int) -> list[dict[str, Any]]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open("history.json", flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENXIO):
+            raise StateError("unsafe history file") from error
+        raise
+
+    try:
+        checked_regular_file(fd, "history.json", max_bytes=MAX_HISTORY_BYTES)
+        content = bytearray()
+        while len(content) <= MAX_HISTORY_BYTES:
+            chunk = os.read(fd, min(8192, MAX_HISTORY_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_HISTORY_BYTES:
+            raise StateError(f"history.json exceeds {MAX_HISTORY_BYTES} bytes")
+    finally:
+        os.close(fd)
+
+    if not content:
+        return []
+    try:
+        decoded = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StateError("history.json is not valid JSON") from error
+    if not isinstance(decoded, list):
+        raise StateError("history.json must contain an array")
+
+    history: list[dict[str, Any]] = []
+    for raw_entry in decoded:
+        entry = normalize_history_entry(raw_entry)
+        if entry is not None:
+            history.append(entry)
+        if len(history) == HISTORY_LIMIT:
+            break
+    return history
+
+
+def write_all(fd: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(fd, content[offset:])
+        if written <= 0:
+            raise StateError("history write made no progress")
+        offset += written
+
+
+def atomic_write_history(directory_fd: int, history: list[dict[str, Any]]) -> None:
+    content = (json.dumps(history[:HISTORY_LIMIT], indent=2) + "\n").encode()
+    if len(content) > MAX_HISTORY_BYTES:
+        raise StateError("serialized history exceeds its size limit")
+
+    temp_name = f".history.{os.getpid()}.{secrets.token_hex(12)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(temp_name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        checked_regular_file(fd, temp_name)
+        write_all(fd, content)
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+    try:
+        os.replace(
+            temp_name,
+            "history.json",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def print_history(history: list[dict[str, Any]]) -> None:
+    sys.stdout.write(json.dumps(history, separators=(",", ":")) + "\n")
+
+
+def command_lock(arguments: argparse.Namespace) -> int:
+    command = list(arguments.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise StateError("lock requires a command")
+
+    directory_fd, path = open_state_directory()
+    lock_fd = open_lock(directory_fd, "speedtest.lock")
+    os.close(directory_fd)
+    if not acquire_lock(lock_fd, nonblocking=True):
+        os.close(lock_fd)
+        if arguments.busy_ok:
+            print("Fast monitor skipped: another speed test is already running")
+            return 0
+        print("Another Fast speed test is already running", file=sys.stderr)
+        return 75
+
+    os.set_inheritable(lock_fd, True)
+    environment = os.environ.copy()
+    environment["MELONAMIN_FAST_LOCK_HELD"] = "1"
+    environment["MELONAMIN_FAST_STATE_DIR"] = path
+    os.execvpe(command[0], command, environment)
+    return 1
+
+
+def command_history_read(_: argparse.Namespace) -> int:
+    directory_fd, _ = open_state_directory()
+    try:
+        print_history(read_history(directory_fd))
+    finally:
+        os.close(directory_fd)
+    return 0
+
+
+def command_history_add(arguments: argparse.Namespace) -> int:
+    entry: dict[str, Any] = {
+        "timestamp": arguments.timestamp,
+        "down": arguments.down,
+        "up": arguments.up,
+        "ping": arguments.ping,
+    }
+    if arguments.automatic:
+        entry["automatic"] = True
+    normalized = normalize_history_entry(entry)
+    if normalized is None:
+        raise StateError("history entry is invalid")
+
+    directory_fd, _ = open_state_directory()
+    history_lock = open_lock(directory_fd, "history.lock")
+    try:
+        acquire_lock(history_lock, nonblocking=False)
+        try:
+            history = read_history(directory_fd)
+        except StateError:
+            history = []
+        history = [normalized, *history][:HISTORY_LIMIT]
+        atomic_write_history(directory_fd, history)
+        print_history(history)
+    finally:
+        os.close(history_lock)
+        os.close(directory_fd)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    lock = commands.add_parser("lock")
+    lock.add_argument("--busy-ok", action="store_true")
+    lock.add_argument("command", nargs=argparse.REMAINDER)
+    lock.set_defaults(handler=command_lock)
+
+    history_read = commands.add_parser("history-read")
+    history_read.set_defaults(handler=command_history_read)
+
+    history_add = commands.add_parser("history-add")
+    history_add.add_argument("--timestamp", required=True, type=float)
+    history_add.add_argument("--down", required=True, type=float)
+    history_add.add_argument("--up", required=True, type=float)
+    history_add.add_argument("--ping", type=float)
+    history_add.add_argument("--automatic", action="store_true")
+    history_add.set_defaults(handler=command_history_add)
+    return root
+
+
+def main() -> int:
+    try:
+        arguments = parser().parse_args()
+        return arguments.handler(arguments)
+    except StateError as error:
+        print(f"safe-state: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"safe-state: {error.strerror or 'state operation failed'}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

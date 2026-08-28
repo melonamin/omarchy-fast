@@ -5,7 +5,7 @@ export LC_ALL=C
 duration="${1:-5}"
 plugin_dir=$(cd "$(dirname "$0")" && pwd)
 phase_helper="${MELONAMIN_FAST_HELPER:-$plugin_dir/run-speedtest}"
-state_dir="${MELONAMIN_FAST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugins/melonamin.fast}"
+state_helper="$plugin_dir/safe-state"
 child_pid=""
 
 [[ $duration =~ ^[0-9]+$ ]] && (( duration > 0 )) || {
@@ -13,18 +13,12 @@ child_pid=""
   exit 2
 }
 
-mkdir -p "$state_dir"
-exec 9>"$state_dir/speedtest.lock"
-if ! flock -n 9; then
-  echo "Another Fast speed test is already running" >&2
-  exit 75
+if [[ ${MELONAMIN_FAST_LOCK_HELD:-0} != 1 ]]; then
+  exec "$state_helper" lock -- "$0" "$duration"
 fi
 
-# Both phase helpers inherit this descriptor and state path. The wrapper keeps
-# descriptor 9 locked until upload finishes, leaving no inter-phase race for
-# the passive timer to enter.
-export MELONAMIN_FAST_LOCK_HELD=1
-export MELONAMIN_FAST_STATE_DIR="$state_dir"
+# The state helper's no-follow descriptor remains locked across both child
+# phases, leaving no inter-phase race for the passive timer to enter.
 
 stop_child() {
   [[ -n $child_pid ]] || return 0

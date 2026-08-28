@@ -44,11 +44,18 @@ The latest eight completed runs are stored below `XDG_STATE_HOME` (falling
 back to `~/.local/state/omarchy/plugins/melonamin.fast/history.json`) and shown
 newest first in the panel.
 
+State access goes through the bundled `safe-state` helper. It walks the state
+directory without following symlinks, keeps lock and temporary-file descriptors
+open, accepts only user-owned regular files, caps history reads at 64 KiB, and
+replaces history atomically. The long-lived shell never opens or watches the
+history pathname directly.
+
 ## Requirements
 
-Omarchy 4 (Quattro) or newer, running `omarchy-shell`. The stock Omarchy
-installation provides the speed-test backend and command-line tools used by
-the plugin. Node is required only for the model test suite.
+Omarchy 4 (Quattro) or newer, running `omarchy-shell`. Python 3 is required at
+runtime for descriptor-safe local state access. The stock Omarchy installation
+provides Python, the speed-test backend, and the other command-line tools used
+by the plugin. Node is required only for the model test suite.
 
 ## Passive monitoring
 
@@ -94,6 +101,7 @@ tests/failure.test.sh
 tests/interactive.test.sh
 tests/scheduled.test.sh
 tests/integration.sh
+python3 tests/state.test.py
 node --test tests/model.test.js
 qmllint BarWidget.qml Panel.qml SignalTrace.qml SparkBurst.qml SpeedRow.qml Model.js
 omarchy plugin validate .
